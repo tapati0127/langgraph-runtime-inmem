@@ -10,6 +10,7 @@ from starlette.applications import Starlette
 
 from langgraph_runtime_inmem import queue
 from langgraph_runtime_inmem.database import start_pool, stop_pool
+from langgraph_runtime_inmem.thread_ttl import thread_ttl_sweep_loop
 
 logger = structlog.stdlib.get_logger(__name__)
 
@@ -109,6 +110,7 @@ async def lifespan(
                 tg.create_task(store_instance.start_ttl_sweeper())  # type: ignore
             else:
                 await logger.ainfo("Using custom store. Skipping store TTL sweeper.")
+            tg.create_task(thread_ttl_sweep_loop())
 
             if feature_flags.USE_RUNTIME_CONTEXT_API:
                 from langgraph._internal._constants import (  # noqa: PLC0415

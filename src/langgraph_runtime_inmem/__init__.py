@@ -8,9 +8,10 @@ from langgraph_runtime_inmem import (
     retry,
     routes,
     store,
+    thread_ttl,
 )
 
-__version__ = "0.33.3"
+__version__ = "0.33.3.post1"
 __all__ = [
     "ops",
     "database",
@@ -21,5 +22,6 @@ __all__ = [
     "queue",
     "metrics",
     "routes",
+    "thread_ttl",
     "__version__",
 ]

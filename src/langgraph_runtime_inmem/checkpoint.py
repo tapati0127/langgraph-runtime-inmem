@@ -5,7 +5,7 @@ import os
 import typing
 import uuid
 from collections import defaultdict
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any
 
 from langgraph.checkpoint.memory import (
@@ -152,10 +152,125 @@ class InMemorySaver(InMemorySaverBase):
     def clear(self):
         self.storage.clear()
         self.writes.clear()
-        for suffix in ["1", "2"]:
+        self.blobs.clear()
+        for suffix in ["1", "2", "3"]:
             file_path = f"{self.filename}{suffix}.pckl"
             if os.path.exists(file_path):
                 os.remove(file_path)
+
+    def prune(
+        self,
+        thread_ids: Sequence[str],
+        *,
+        strategy: str = "keep_latest",
+    ) -> None:
+        """Prune checkpoint history for one or more threads.
+
+        ``keep_latest`` retains the newest checkpoint in every checkpoint
+        namespace.  If a channel's value is not materialized at that newest
+        checkpoint (the representation used by ``DeltaChannel``), the parent
+        chain is retained until the nearest materialized snapshot.  This keeps
+        delta-backed state reconstructable while still removing old branches,
+        obsolete checkpoints, writes, and blobs.
+        """
+        if strategy in {"delete", "delete_all"}:
+            for thread_id in thread_ids:
+                self.delete_thread(str(thread_id))
+            return
+        if strategy != "keep_latest":
+            raise ValueError(
+                "Unsupported prune strategy: "
+                f"{strategy!r}. Expected 'keep_latest' or 'delete'."
+            )
+
+        for raw_thread_id in thread_ids:
+            thread_id = str(raw_thread_id)
+            namespaces = self.storage.get(thread_id)
+            if not namespaces:
+                continue
+
+            kept_write_keys: set[tuple[str, str, str]] = set()
+            kept_blob_keys: set[tuple[Any, ...]] = set()
+
+            for checkpoint_ns, checkpoints in list(namespaces.items()):
+                if not checkpoints:
+                    del namespaces[checkpoint_ns]
+                    continue
+
+                # Checkpoint IDs are monotonically sortable strings in
+                # LangGraph.  ``key=str`` also tolerates legacy UUID objects.
+                latest_id = max(checkpoints, key=str)
+                keep_ids = {latest_id}
+                latest_entry = checkpoints[latest_id]
+                latest_checkpoint = self.serde.loads_typed(latest_entry[0])
+
+                # Missing/empty values need the ancestor write chain.  This is
+                # how DeltaChannel stores non-snapshot checkpoints.
+                needed_channels = {
+                    channel
+                    for channel, version in latest_checkpoint.get(
+                        "channel_versions", {}
+                    ).items()
+                    if (
+                        (
+                            blob := self.blobs.get(
+                                (thread_id, checkpoint_ns, channel, version)
+                            )
+                        )
+                        is None
+                        or blob[0] == "empty"
+                    )
+                }
+
+                parent_id = latest_entry[2]
+                while parent_id is not None and needed_channels:
+                    parent_entry = checkpoints.get(parent_id)
+                    if parent_entry is None:
+                        break
+                    keep_ids.add(parent_id)
+                    parent_checkpoint = self.serde.loads_typed(parent_entry[0])
+                    parent_versions = parent_checkpoint.get("channel_versions", {})
+                    for channel in tuple(needed_channels):
+                        version = parent_versions.get(channel)
+                        if version is None:
+                            continue
+                        blob = self.blobs.get(
+                            (thread_id, checkpoint_ns, channel, version)
+                        )
+                        if blob is not None and blob[0] != "empty":
+                            needed_channels.remove(channel)
+                    parent_id = parent_entry[2]
+
+                namespaces[checkpoint_ns] = {
+                    checkpoint_id: entry
+                    for checkpoint_id, entry in checkpoints.items()
+                    if checkpoint_id in keep_ids
+                }
+
+                for checkpoint_id in keep_ids:
+                    kept_write_keys.add((thread_id, checkpoint_ns, str(checkpoint_id)))
+                    checkpoint = self.serde.loads_typed(checkpoints[checkpoint_id][0])
+                    for channel, version in checkpoint.get(
+                        "channel_versions", {}
+                    ).items():
+                        kept_blob_keys.add((thread_id, checkpoint_ns, channel, version))
+
+            for key in list(self.writes):
+                normalized_key = (str(key[0]), key[1], str(key[2]))
+                if str(key[0]) == thread_id and normalized_key not in kept_write_keys:
+                    del self.writes[key]
+
+            for key in list(self.blobs):
+                if str(key[0]) == thread_id and key not in kept_blob_keys:
+                    del self.blobs[key]
+
+    async def aprune(
+        self,
+        thread_ids: Sequence[str],
+        *,
+        strategy: str = "keep_latest",
+    ) -> None:
+        self.prune(thread_ids, strategy=strategy)
 
     async def _decrypt_json(self, data: dict[str, Any]) -> dict[str, Any]:
         """Decrypt a dict if custom encryption is configured."""

@@ -8,7 +8,6 @@ import copy
 import json
 import typing
 import uuid
-from collections import defaultdict
 from collections.abc import AsyncIterator, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -69,6 +68,106 @@ if typing.TYPE_CHECKING:
 StreamHandler = ContextQueue
 
 logger = structlog.stdlib.get_logger(__name__)
+
+_THREAD_TTL_STORE_KEY = "thread_ttls"
+
+
+def _thread_ttl_store(conn: InMemConnectionProto) -> dict[str, dict[str, Any]]:
+    """Return the persistent sidecar used for internal thread TTL state."""
+    ttl_store = conn.store.get(_THREAD_TTL_STORE_KEY)
+    if not isinstance(ttl_store, dict):
+        ttl_store = {}
+        conn.store[_THREAD_TTL_STORE_KEY] = ttl_store
+    return ttl_store
+
+
+def _normalize_ttl_config(config: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not config:
+        return None
+    strategy = str(config.get("strategy", "delete")).lower()
+    if strategy not in {"delete", "keep_latest"}:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Invalid thread TTL strategy: {strategy}. "
+                "Expected 'delete' or 'keep_latest'."
+            ),
+        )
+    ttl_minutes = config.get(
+        "ttl", config.get("ttl_minutes", config.get("default_ttl"))
+    )
+    if ttl_minutes is None:
+        return None
+    try:
+        ttl_minutes = float(ttl_minutes)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=422, detail="Thread TTL must be a number of minutes."
+        ) from None
+    if ttl_minutes < 0:
+        raise HTTPException(
+            status_code=422, detail="Thread TTL must be greater than or equal to 0."
+        )
+    return {"strategy": strategy, "ttl_minutes": ttl_minutes}
+
+
+def _global_ttl_config() -> dict[str, Any] | None:
+    from langgraph_api import config as api_config  # noqa: PLC0415
+
+    return _normalize_ttl_config(api_config.THREAD_TTL)
+
+
+def _effective_thread_ttl(
+    conn: InMemConnectionProto, thread_id: str | UUID
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    ttl_store = _thread_ttl_store(conn)
+    state = ttl_store.get(str(thread_id), {})
+    if "ttl_minutes" in state:
+        config = {
+            "strategy": state.get("strategy", "delete"),
+            "ttl_minutes": state["ttl_minutes"],
+        }
+    else:
+        config = _global_ttl_config()
+    return config, state
+
+
+def _set_thread_ttl_override(
+    conn: InMemConnectionProto,
+    thread_id: str | UUID,
+    ttl: dict[str, Any],
+) -> None:
+    ttl_store = _thread_ttl_store(conn)
+    normalized = _normalize_ttl_config(ttl)
+    thread_key = str(thread_id)
+    if normalized is None:
+        ttl_store.pop(thread_key, None)
+    else:
+        ttl_store[thread_key] = normalized
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _thread_ttl_info(
+    thread: dict[str, Any],
+    config: dict[str, Any],
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    updated_at = _as_utc(thread["updated_at"])
+    last_swept = state.get("last_swept_updated_at")
+    already_pruned = last_swept is not None and _as_utc(last_swept) >= updated_at
+    return {
+        "strategy": config["strategy"],
+        "ttl_minutes": config["ttl_minutes"],
+        "expires_at": (
+            None
+            if already_pruned and config["strategy"] == "keep_latest"
+            else updated_at + timedelta(minutes=config["ttl_minutes"])
+        ),
+    }
+
 
 # Only gate features on the major.minor version; Lets you ignore the rc/alpha/etc. releases anyway
 LANGGRAPH_PY_MINOR = tuple(map(int, __version__.split(".")[:2]))
@@ -979,7 +1078,7 @@ class Threads(Authenticated):
             conn: In-memory connection
             thread_id: Thread ID
             ctx: Auth context
-            include_ttl: Not supported in inmem - parameter ignored.
+            include_ttl: Include the effective TTL configuration and expiry.
             read_mask_paths: Column restriction hint for the postgres runtime;
                 ignored for inmem since there's no values-column I/O to skip.
         """
@@ -990,9 +1089,16 @@ class Threads(Authenticated):
                 status_code=404, detail=f"Thread with ID {thread_id} not found"
             )
 
+        result = matching_thread
+        if include_ttl:
+            result = copy.deepcopy(matching_thread)
+            ttl_config, ttl_state = _effective_thread_ttl(conn, thread_id)
+            if ttl_config is not None:
+                result["ttl"] = _thread_ttl_info(matching_thread, ttl_config, ttl_state)
+
         async def _yield_result():
-            if matching_thread:
-                yield matching_thread
+            if result:
+                yield result
 
         return _yield_result()
 
@@ -1061,6 +1167,8 @@ class Threads(Authenticated):
 
         # Add to store
         conn.store["threads"].append(new_thread)
+        if ttl is not None:
+            _set_thread_ttl_override(conn, thread_id, ttl)
 
         async def _yield_new():
             yield new_thread
@@ -1101,6 +1209,8 @@ class Threads(Authenticated):
                 thread["metadata"] = {**thread["metadata"], **metadata}
                 thread["updated_at"] = datetime.now(UTC)
                 thread_list[thread_idx] = thread
+                if ttl is not None:
+                    _set_thread_ttl_override(conn, thread_id, ttl)
 
                 async def thread_iterator() -> AsyncIterator[Thread]:
                     yield thread
@@ -1291,20 +1401,27 @@ class Threads(Authenticated):
         """Delete a thread by ID and cascade delete all associated runs."""
         thread_list = conn.store["threads"]
         thread_idx = None
+        matching_thread = None
         thread_id = _ensure_uuid(thread_id)
 
         # Find the thread to delete
         for idx, thread in enumerate(thread_list):
             if thread["thread_id"] == thread_id:
                 thread_idx = idx
+                matching_thread = thread
                 break
         filters = await Threads.handle_event(
             ctx,
             "delete",
             Auth.types.ThreadsDelete(thread_id=thread_id),
         )
-        if (filters and not _check_filter_match(thread["metadata"], filters)) or (
+        if (
             thread_idx is None
+            or matching_thread is None
+            or (
+                filters
+                and not _check_filter_match(matching_thread["metadata"], filters)
+            )
         ):
             raise HTTPException(
                 status_code=404, detail=f"Thread with ID {thread_id} not found"
@@ -1322,6 +1439,7 @@ class Threads(Authenticated):
         if thread_idx is not None:
             # Remove the thread from the store
             deleted_thread = thread_list.pop(thread_idx)
+            _thread_ttl_store(conn).pop(str(thread_id), None)
 
             # Return an async iterator with the deleted thread_id
             async def id_iterator() -> AsyncIterator[UUID]:
@@ -1347,8 +1465,9 @@ class Threads(Authenticated):
 
         Args:
             thread_ids: List of thread IDs to prune
-            strategy: Prune strategy ("delete" supported, "keep_latest" not supported)
-            batch_size: Not used in inmem implementation
+            strategy: ``delete`` removes the thread; ``keep_latest`` retains
+                the newest checkpoint per namespace.
+            batch_size: Maximum number of thread IDs per checkpointer call.
             ctx: Auth context for permission checks
 
         Returns:
@@ -1377,24 +1496,39 @@ class Threads(Authenticated):
                         detail="At least one thread not found or not authorized",
                     )
 
-        if strategy == "keep_latest":
+        if strategy not in {"delete", "keep_latest"}:
             raise HTTPException(
                 status_code=422,
-                detail="keep_latest strategy is not supported in in-memory runtime",
+                detail=f"Unsupported prune strategy: {strategy}",
             )
 
         pruned = 0
         async with connect() as conn:
-            for tid in thread_ids:
-                try:
-                    tid_uuid = _ensure_uuid(tid)
-                    iter_result = await Threads.delete(conn, tid_uuid, ctx)
-                    # Consume the iterator to ensure deletion
-                    async for _ in iter_result:
-                        pruned += 1
-                except HTTPException:
-                    # Thread not found or no permission - skip silently
-                    pass
+            if strategy == "delete":
+                for tid in thread_ids:
+                    try:
+                        tid_uuid = _ensure_uuid(tid)
+                        iter_result = await Threads.delete(conn, tid_uuid, ctx)
+                        async for _ in iter_result:
+                            pruned += 1
+                    except HTTPException:
+                        # Thread not found or no permission - skip silently
+                        pass
+            else:
+                existing_ids = {
+                    str(thread["thread_id"])
+                    for thread in conn.store["threads"]
+                    if str(thread["thread_id"]) in {str(tid) for tid in thread_ids}
+                }
+                checkpointer = await _get_checkpointer(conn)
+                ordered_ids = [
+                    str(tid) for tid in thread_ids if str(tid) in existing_ids
+                ]
+                batch_size = max(1, batch_size)
+                for offset in range(0, len(ordered_ids), batch_size):
+                    batch = ordered_ids[offset : offset + batch_size]
+                    await checkpointer.aprune(batch, strategy="keep_latest")
+                    pruned += len(batch)
 
         return pruned
 
@@ -1461,6 +1595,12 @@ class Threads(Authenticated):
 
             # Add new thread to store
             conn.store["threads"].append(new_thread)
+            original_ttl = _thread_ttl_store(conn).get(str(thread_id))
+            if original_ttl and "ttl_minutes" in original_ttl:
+                _thread_ttl_store(conn)[str(new_thread_id)] = {
+                    "strategy": original_ttl.get("strategy", "delete"),
+                    "ttl_minutes": original_ttl["ttl_minutes"],
+                }
 
             from langgraph_api import config as api_config  # noqa: PLC0415
 
@@ -1513,8 +1653,91 @@ class Threads(Authenticated):
         limit: int | None = None,
         batch_size: int = 100,
     ) -> tuple[int, int]:
-        # Not implemented for inmem server
-        return (0, 0)
+        """Sweep expired threads using their per-thread or global TTL policy.
+
+        Returns ``(threads_processed, threads_deleted)``.  A
+        ``keep_latest`` thread counts as processed but not deleted.
+        """
+        if limit is not None and limit <= 0:
+            return (0, 0)
+        batch_size = max(1, batch_size)
+
+        from langgraph_api import config as api_config  # noqa: PLC0415
+
+        configured_limit = (api_config.THREAD_TTL or {}).get("sweep_limit", 10000)
+        effective_limit = limit if limit is not None else configured_limit
+        if effective_limit is not None:
+            effective_limit = max(0, int(effective_limit))
+
+        now = datetime.now(UTC)
+        expired: list[
+            tuple[datetime, UUID, dict[str, Any], dict[str, Any], datetime]
+        ] = []
+        active_thread_ids = {
+            run["thread_id"]
+            for run in conn.store["runs"]
+            if run["status"] in {"pending", "running"}
+        }
+
+        for thread in list(conn.store["threads"]):
+            thread_id = thread["thread_id"]
+            if thread_id in active_thread_ids:
+                continue
+            ttl_config, ttl_state = _effective_thread_ttl(conn, thread_id)
+            if ttl_config is None:
+                continue
+            updated_at = _as_utc(thread["updated_at"])
+            last_swept = ttl_state.get("last_swept_updated_at")
+            if (
+                ttl_config["strategy"] == "keep_latest"
+                and last_swept is not None
+                and _as_utc(last_swept) >= updated_at
+            ):
+                continue
+            expires_at = updated_at + timedelta(minutes=ttl_config["ttl_minutes"])
+            if expires_at <= now:
+                expired.append(
+                    (expires_at, thread_id, ttl_config, ttl_state, updated_at)
+                )
+
+        expired.sort(key=lambda item: (item[0], str(item[1])))
+        if effective_limit is not None:
+            expired = expired[:effective_limit]
+
+        processed = 0
+        deleted = 0
+        checkpointer = None
+        for offset in range(0, len(expired), batch_size):
+            batch = expired[offset : offset + batch_size]
+            keep_latest_ids = [
+                str(thread_id)
+                for _, thread_id, ttl_config, _, _ in batch
+                if ttl_config["strategy"] == "keep_latest"
+            ]
+            if keep_latest_ids:
+                if checkpointer is None:
+                    checkpointer = await _get_checkpointer(conn)
+                await checkpointer.aprune(keep_latest_ids, strategy="keep_latest")
+
+            for _, thread_id, ttl_config, ttl_state, updated_at in batch:
+                if ttl_config["strategy"] == "delete":
+                    try:
+                        deleted_iter = await Threads.delete(conn, thread_id)
+                        async for _ in deleted_iter:
+                            deleted += 1
+                            processed += 1
+                    except HTTPException as exc:
+                        if exc.status_code != 404:
+                            raise
+                else:
+                    # Do not prune the same inactive state every minute.  Any
+                    # later thread update advances ``updated_at`` and makes it
+                    # eligible again after another full TTL period.
+                    ttl_state["last_swept_updated_at"] = updated_at
+                    _thread_ttl_store(conn)[str(thread_id)] = ttl_state
+                    processed += 1
+
+        return (processed, deleted)
 
     class State(Authenticated):
         # We will treat this like a runs resource for now.
@@ -3832,6 +4055,12 @@ async def _delete_checkpoints_for_thread(
 
     checkpointer = Checkpointer()
     thread_id = str(thread_id)
+    if not run_id:
+        # Use the saver's deletion API so storage, pending writes, and blobs
+        # are all released.  The previous in-memory implementation removed
+        # storage/writes manually and leaked channel blobs.
+        await checkpointer.adelete_thread(thread_id)
+        return
     if thread_id not in checkpointer.storage:
         return
     if run_id:
@@ -3844,12 +4073,6 @@ async def _delete_checkpoints_for_thread(
                     del checkpointer.storage[thread_id][checkpoint_ns][checkpoint_id]
                     if not checkpointer.storage[thread_id][checkpoint_ns]:
                         del checkpointer.storage[thread_id][checkpoint_ns]
-    else:
-        del checkpointer.storage[thread_id]
-        # Keys are (thread_id, checkpoint_ns, checkpoint_id)
-        checkpointer.writes = defaultdict(
-            dict, {k: v for k, v in checkpointer.writes.items() if k[0] != thread_id}
-        )
 
 
 def _validate_filter_structure(

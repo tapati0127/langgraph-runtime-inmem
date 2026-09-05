@@ -46,6 +46,14 @@ class Thread(TypedDict):
     status: str
 
 
+class ThreadTTLState(TypedDict, total=False):
+    """Internal per-thread TTL override and keep-latest sweep marker."""
+
+    strategy: str
+    ttl_minutes: float
+    last_swept_updated_at: datetime
+
+
 class Run(TypedDict):
     run_id: UUID
     thread_id: UUID
@@ -94,6 +102,7 @@ class GlobalStore(PersistentDict):
         ]
         self["assistant_versions"] = []
         self["crons"] = []
+        self["thread_ttls"] = {}
 
 
 OPS_FILENAME = os.path.join(".langgraph_api", ".langgraph_ops.pckl")
@@ -185,6 +194,8 @@ async def start_pool() -> None:
     for k in ["runs", "threads", "assistant_versions", "assistants"]:
         if not GLOBAL_STORE.get(k):
             GLOBAL_STORE[k] = []
+    if not isinstance(GLOBAL_STORE.get("thread_ttls"), dict):
+        GLOBAL_STORE["thread_ttls"] = {}
     # Remove agents that were created by the system to avoid removed graphs
     if GLOBAL_STORE.get("assistants"):
         for a in GLOBAL_STORE["assistants"]:
