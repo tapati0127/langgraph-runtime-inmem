@@ -1,0 +1,306 @@
+from __future__ import annotations
+
+from collections import defaultdict
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from uuid import UUID, uuid4
+
+import pytest
+from langgraph.checkpoint.memory import InMemorySaver as OSSInMemorySaver
+from langgraph.checkpoint.serde.types import _DeltaSnapshot
+from langgraph_runtime_inmem import ops
+from langgraph_runtime_inmem.checkpoint import InMemorySaver
+
+
+class FakeConnection:
+    def __init__(self) -> None:
+        self.store = {
+            "threads": [],
+            "runs": [],
+            "crons": [],
+            "assistants": [],
+            "assistant_versions": [],
+            "thread_ttls": {},
+        }
+
+    @asynccontextmanager
+    async def pipeline(self):
+        yield None
+
+
+@pytest.fixture
+def conn() -> FakeConnection:
+    return FakeConnection()
+
+
+@pytest.fixture
+def saver(monkeypatch: pytest.MonkeyPatch) -> InMemorySaver:
+    # Avoid disk persistence in unit tests while exercising the patched saver.
+    instance = object.__new__(InMemorySaver)
+    OSSInMemorySaver.__init__(instance, factory=defaultdict)
+    monkeypatch.setattr(ops, "Checkpointer", lambda *args, **kwargs: instance)
+    return instance
+
+
+@pytest.fixture(autouse=True)
+def reset_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    from langgraph_api import config as api_config
+
+    monkeypatch.setattr(api_config, "THREAD_TTL", None)
+    monkeypatch.setattr(api_config, "USE_CUSTOM_CHECKPOINTER", False)
+
+
+def add_checkpoint(
+    saver: InMemorySaver,
+    thread_id: UUID,
+    checkpoint_id: str,
+    *,
+    parent_id: str | None = None,
+    namespace: str = "",
+    value: object = None,
+    materialized: bool = True,
+) -> None:
+    config = {
+        "configurable": {
+            "thread_id": str(thread_id),
+            "checkpoint_ns": namespace,
+            **({"checkpoint_id": parent_id} if parent_id else {}),
+        }
+    }
+    channel_values = {"state": value} if materialized else {}
+    saver.put(
+        config,
+        {
+            "v": 1,
+            "ts": datetime.now(UTC).isoformat(),
+            "id": checkpoint_id,
+            "channel_values": channel_values,
+            "channel_versions": {"state": checkpoint_id},
+            "versions_seen": {},
+            "pending_sends": [],
+            "updated_channels": ["state"],
+        },
+        {"source": "loop", "step": int(checkpoint_id[:4])},
+        {"state": checkpoint_id},
+    )
+    saver.put_writes(
+        {
+            "configurable": {
+                "thread_id": str(thread_id),
+                "checkpoint_ns": namespace,
+                "checkpoint_id": checkpoint_id,
+            }
+        },
+        [("state", value)],
+        f"task-{checkpoint_id}",
+    )
+
+
+async def create_thread(
+    conn: FakeConnection,
+    *,
+    thread_id: UUID | None = None,
+    ttl: dict | None = None,
+    age_minutes: float = 0,
+):
+    thread_id = thread_id or uuid4()
+    iterator = await ops.Threads.put(
+        conn,
+        thread_id,
+        metadata={},
+        if_exists="raise",
+        ttl=ttl,
+    )
+    thread = await anext(iterator)
+    if age_minutes:
+        old = datetime.now(UTC) - timedelta(minutes=age_minutes)
+        thread["created_at"] = old
+        thread["updated_at"] = old
+        thread["state_updated_at"] = old
+    return thread
+
+
+@pytest.mark.asyncio
+async def test_explicit_ttl_is_visible_and_overrides_global(conn) -> None:
+    from langgraph_api import config as api_config
+
+    api_config.THREAD_TTL = {
+        "strategy": "keep_latest",
+        "default_ttl": 43200,
+        "sweep_interval_minutes": 1,
+    }
+    thread = await create_thread(
+        conn,
+        ttl={"strategy": "delete", "ttl": 10},
+    )
+
+    iterator = await ops.Threads.get(conn, thread["thread_id"], include_ttl=True)
+    result = await anext(iterator)
+
+    assert result["ttl"]["strategy"] == "delete"
+    assert result["ttl"]["ttl_minutes"] == 10
+    assert result["ttl"]["expires_at"] == thread["updated_at"] + timedelta(minutes=10)
+    assert "ttl" not in thread
+
+
+@pytest.mark.asyncio
+async def test_delete_sweep_cascades_and_releases_all_checkpoint_memory(
+    conn, saver
+) -> None:
+    thread = await create_thread(
+        conn,
+        ttl={"strategy": "delete", "ttl": 1},
+        age_minutes=2,
+    )
+    thread_id = thread["thread_id"]
+    run_id = uuid4()
+    conn.store["runs"].append(
+        {
+            "run_id": run_id,
+            "thread_id": thread_id,
+            "status": "success",
+        }
+    )
+    conn.store["crons"].append({"cron_id": uuid4(), "thread_id": thread_id})
+    add_checkpoint(saver, thread_id, "0001", value={"large": "payload"})
+
+    assert saver.storage and saver.writes and saver.blobs
+    assert await ops.Threads.sweep_ttl(conn) == (1, 1)
+    assert conn.store["threads"] == []
+    assert conn.store["runs"] == []
+    assert conn.store["crons"] == []
+    assert conn.store["thread_ttls"] == {}
+    assert not saver.storage
+    assert not saver.writes
+    assert not saver.blobs
+
+
+@pytest.mark.asyncio
+async def test_global_keep_latest_prunes_once_then_rearms_after_activity(
+    conn, saver
+) -> None:
+    from langgraph_api import config as api_config
+
+    api_config.THREAD_TTL = {
+        "strategy": "keep_latest",
+        "default_ttl": 1,
+        "sweep_interval_minutes": 1,
+        "sweep_limit": 100,
+    }
+    thread = await create_thread(conn, age_minutes=2)
+    thread_id = thread["thread_id"]
+    add_checkpoint(saver, thread_id, "0001", value="old")
+    add_checkpoint(saver, thread_id, "0002", parent_id="0001", value="latest")
+    add_checkpoint(saver, thread_id, "0001", namespace="child", value="child-old")
+    add_checkpoint(
+        saver,
+        thread_id,
+        "0002",
+        parent_id="0001",
+        namespace="child",
+        value="child-latest",
+    )
+
+    assert await ops.Threads.sweep_ttl(conn) == (1, 0)
+    assert len(conn.store["threads"]) == 1
+    assert set(saver.storage[str(thread_id)][""]) == {"0002"}
+    assert set(saver.storage[str(thread_id)]["child"]) == {"0002"}
+    assert len([key for key in saver.writes if key[0] == str(thread_id)]) == 2
+    assert len([key for key in saver.blobs if key[0] == str(thread_id)]) == 2
+
+    # The same inactive state is not repeatedly pruned every sweep.
+    assert await ops.Threads.sweep_ttl(conn) == (0, 0)
+    iterator = await ops.Threads.get(conn, thread_id, include_ttl=True)
+    assert (await anext(iterator))["ttl"]["expires_at"] is None
+
+    # A subsequent write/activity advances updated_at and rearms the TTL.
+    thread["updated_at"] = thread["updated_at"] + timedelta(seconds=1)
+    assert await ops.Threads.sweep_ttl(conn) == (1, 0)
+
+
+def test_keep_latest_preserves_delta_ancestor_chain(saver) -> None:
+    thread_id = uuid4()
+    add_checkpoint(
+        saver,
+        thread_id,
+        "0001",
+        value=_DeltaSnapshot(["seed"]),
+    )
+    add_checkpoint(
+        saver,
+        thread_id,
+        "0002",
+        parent_id="0001",
+        value=["delta-1"],
+        materialized=False,
+    )
+    add_checkpoint(
+        saver,
+        thread_id,
+        "0003",
+        parent_id="0002",
+        value=["delta-2"],
+        materialized=False,
+    )
+    # An obsolete fork should still be removed.
+    add_checkpoint(
+        saver,
+        thread_id,
+        "0002-fork",
+        parent_id="0001",
+        value=["fork"],
+        materialized=False,
+    )
+
+    saver.prune([str(thread_id)], strategy="keep_latest")
+
+    assert set(saver.storage[str(thread_id)][""]) == {"0001", "0002", "0003"}
+    assert (str(thread_id), "", "0002-fork") not in saver.writes
+
+
+@pytest.mark.asyncio
+async def test_sweep_limit_and_active_run_protection(conn, saver) -> None:
+    first = await create_thread(
+        conn, ttl={"strategy": "delete", "ttl": 1}, age_minutes=3
+    )
+    second = await create_thread(
+        conn, ttl={"strategy": "delete", "ttl": 1}, age_minutes=2
+    )
+    active = await create_thread(
+        conn, ttl={"strategy": "delete", "ttl": 1}, age_minutes=4
+    )
+    conn.store["runs"].append(
+        {
+            "run_id": uuid4(),
+            "thread_id": active["thread_id"],
+            "status": "running",
+        }
+    )
+
+    assert await ops.Threads.sweep_ttl(conn, limit=1) == (1, 1)
+    remaining = {thread["thread_id"] for thread in conn.store["threads"]}
+    assert first["thread_id"] not in remaining
+    assert second["thread_id"] in remaining
+    assert active["thread_id"] in remaining
+
+
+@pytest.mark.asyncio
+async def test_manual_keep_latest_prune_uses_checkpointer(
+    conn, saver, monkeypatch
+) -> None:
+    thread = await create_thread(conn)
+    add_checkpoint(saver, thread["thread_id"], "0001", value="old")
+    add_checkpoint(saver, thread["thread_id"], "0002", parent_id="0001", value="new")
+
+    @asynccontextmanager
+    async def use_test_connection(*args, **kwargs):
+        yield conn
+
+    monkeypatch.setattr(ops, "connect", use_test_connection)
+    assert (
+        await ops.Threads.prune(
+            [thread["thread_id"]], strategy="keep_latest", batch_size=1
+        )
+        == 1
+    )
+    assert set(saver.storage[str(thread["thread_id"])][""]) == {"0002"}

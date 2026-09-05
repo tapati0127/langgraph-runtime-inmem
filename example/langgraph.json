@@ -1,0 +1,14 @@
+{
+  "dependencies": [".."],
+  "graphs": {
+    "ttl_test": "./graph.py:graph"
+  },
+  "env": ".env",
+  "checkpointer": {
+    "ttl": {
+      "strategy": "keep_latest",
+      "sweep_interval_minutes": 1,
+      "default_ttl": 43200
+    }
+  }
+}
