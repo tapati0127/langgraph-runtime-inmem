@@ -11,7 +11,7 @@ from langgraph_runtime_inmem import (
     thread_ttl,
 )
 
-__version__ = "0.33.3.post1"
+__version__ = "0.33.3.post2"
 __all__ = [
     "ops",
     "database",

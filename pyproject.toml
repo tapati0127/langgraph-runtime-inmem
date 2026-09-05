@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "langgraph-runtime-inmem"
-version = "0.33.3.post1"
-description = "In-memory implementation for the LangGraph API server, patched with thread TTL support."
+version = "0.33.3.post2"
+description = "In-memory implementation for the LangGraph API server, patched with thread and store TTL support."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Elastic-2.0"

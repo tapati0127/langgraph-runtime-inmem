@@ -10,5 +10,12 @@
       "sweep_interval_minutes": 1,
       "default_ttl": 43200
     }
+  },
+  "store": {
+    "ttl": {
+      "refresh_on_read": true,
+      "sweep_interval_minutes": 1,
+      "default_ttl": 10080
+    }
   }
 }
