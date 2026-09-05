@@ -7,72 +7,85 @@
 - `langgraph-api==0.13.3`
 - `langgraph-cli[inmem]==0.4.31`
 - `langgraph-checkpoint==4.2.0`
-- Patched runtime: `langgraph-runtime-inmem==0.33.3.post1`
+- Patched runtime: `langgraph-runtime-inmem==0.33.3.post2`
 
 An additional compatibility run replaced `langgraph-api==0.13.3` with
-`langgraph-api==0.13.2`; all seven tests passed there as well.
+`langgraph-api==0.13.2`; all 21 tests passed there as well.
 
 ## Automated tests
 
 ```text
-.......                                                                  [100%]
-7 passed in 0.23s
+.....................                                                    [100%]
+21 passed in 0.92s
 ```
 
 Compatibility run:
 
 ```text
 langgraph-api=0.13.2
-langgraph-runtime-inmem=0.33.3.post1
-7 passed in 0.24s
+langgraph-runtime-inmem=0.33.3.post2
+21 passed in 0.86s
 ```
 
-Covered cases:
+The seven thread/checkpointer TTL tests cover:
 
-1. Per-thread TTL overrides the global TTL and is returned by `include=ttl`.
-2. `delete` removes thread, runs, crons, checkpoint storage, writes, blobs, and
-   TTL metadata.
-3. Global `keep_latest` keeps one checkpoint per namespace.
-4. An unchanged thread is not processed on every subsequent sweep; activity
-   rearms the TTL.
-5. DeltaChannel ancestor checkpoints are retained back to the nearest stored
-   snapshot while an obsolete fork is deleted.
-6. `limit` is honored and threads with a pending/running run are skipped.
-7. The background loop uses the configured one-minute interval and invokes
-   `Threads.sweep_ttl()` with the configured sweep limit.
+1. Per-thread TTL overrides and `include=ttl` visibility.
+2. Cascade deletion of threads, runs, crons, checkpoint storage, writes,
+   blobs, and TTL metadata.
+3. Global `keep_latest` pruning and rearming after later activity.
+4. DeltaChannel ancestor-chain preservation while obsolete forks are removed.
+5. Sweep limits and protection for pending/running runs.
+6. Manual `keep_latest` pruning.
+7. Background-loop interval and sweep-limit propagation.
 
-Targeted Ruff syntax/import checks and format checks also passed.
+The fourteen Store TTL test cases cover:
+
+1. `default_ttl`, per-item overrides, and `ttl=None`.
+2. Default and per-operation `get` refresh behavior.
+3. `search` refresh limited to returned items.
+4. TTL reset on writes and metadata removal on deletes.
+5. Non-retroactive defaults and per-item TTL without a global default.
+6. Atomic removal of item data, vectors, and TTL metadata.
+7. Background sweeper startup, deduplication, deletion, and shutdown.
+8. TTL metadata persistence across a disk-backed restart.
+9. Propagation of TTL configuration through the Agent Server `BatchedStore`.
+10. No-op behavior without TTL configuration and validation of sweep intervals.
+
+`pytest -W error`, Python bytecode compilation, targeted Ruff checks, Ruff
+format checks, and `git diff --check` all passed. Files inherited from upstream
+outside this change still contain pre-existing warnings under Ruff 0.16.6, so
+the lint command was scoped to the modified Store implementation and its tests.
 
 ## Wheel verification
 
-The final wheel was force-installed into the clean test environment (replacing
-the editable source) and the seven tests were rerun successfully against the
-installed package.
+The final wheel was force-installed into the test environment, replacing the
+editable source. Tests were then run from `/tmp` with a separate pytest root so
+the repository's `pythonpath = ["src"]` setting could not shadow the wheel.
 
 ```text
-version=0.33.3.post1
+version=0.33.3.post2
 loaded_from=.../site-packages/langgraph_runtime_inmem/__init__.py
-7 passed in 0.23s
+21 passed in 0.83s
 ```
 
 Wheel SHA-256:
 
 ```text
-50663ea154b858a67e4724572e4c2d1f8be500b1477ce214afe53661d7c25399
+d1bfd695a1f2f7ab194a8b69d8ffdc86a92bded3ca11a9cb89685f2dcabb6931
 ```
 
-## `langgraph dev` smoke test
+## `langgraph dev` startup smoke test
 
-`langgraph dev --no-browser --no-reload --port 8123` started successfully with
-the included example and the requested configuration.  Relevant startup logs:
+`langgraph dev --no-browser --no-reload --port 8123` reached application-ready
+state with the combined thread and Store TTL example configuration. Relevant
+startup logs:
 
 ```text
-Starting In-Memory runtime with langgraph-api=0.13.3 and in-memory runtime=0.33.3.post1
+Starting In-Memory runtime with langgraph-api=0.13.3 and in-memory runtime=0.33.3.post2
+Starting store TTL sweeper with interval 1.0 minutes
 Starting thread TTL sweeper with interval 1 minutes strategy=keep_latest
 Application started up
 ```
 
-With `default_ttl=43200`, expiry is 30 days after the latest thread update, so a
-short smoke test intentionally verifies activation/configuration rather than
-waiting for production expiry.  Immediate expiration and both sweep strategies
-are exercised by the automated tests.
+The deterministic automated tests use a controlled clock and immediate expiry
+to verify actual deletion without waiting for production-length TTL windows.

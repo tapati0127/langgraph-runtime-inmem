@@ -218,6 +218,7 @@ async def stop_pool() -> None:
     from langgraph_runtime_inmem.checkpoint import Checkpointer  # noqa: PLC0415
     from langgraph_runtime_inmem.store import STORE  # noqa: PLC0415
 
+    await STORE.stop_ttl_sweeper(timeout=5)
     await asyncio.to_thread(STORE.close)
 
     async with Checkpointer():
