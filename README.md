@@ -1,7 +1,7 @@
 # langgraph-runtime-inmem 0.33.3 TTL fixes
 
 This is a source-compatible patch for `langgraph-runtime-inmem==0.33.3`.  The
-wheel version is `0.33.3.post2` so pip can distinguish it from the unpatched
+wheel version is `0.33.3.post3` so pip can distinguish it from the unpatched
 upstream wheel.
 
 ## What is implemented
@@ -25,8 +25,11 @@ upstream wheel.
   `refresh_on_read` and each operation's `refresh_ttl` override.
 - Persists item TTL metadata alongside the disk-backed data and vector files,
   and deletes the item, its vectors, and its TTL metadata in one sweep.
-- Runs the store sweeper in the background and emits the standard
-  `Starting store TTL sweeper ...` and `Store swept ...` logs.
+- Tracks estimated serialized bytes when Store/checkpoint data is written,
+  overwritten, copied, pruned, or deleted, then emits size metrics for both
+  sweepers.
+- Runs the store sweeper in the background and emits startup and completion
+  logs on every sweep, including sweeps that remove zero items.
 
 For `keep_latest`, an expired inactive thread is pruned once.  It becomes
 eligible again only after its `updated_at` advances and another full TTL period
@@ -37,7 +40,7 @@ sweep interval.
 
 ```bash
 pip install --force-reinstall --no-deps \
-  release/langgraph_runtime_inmem-0.33.3.post2-py3-none-any.whl
+  release/langgraph_runtime_inmem-0.33.3.post3-py3-none-any.whl
 ```
 
 Verify that `langgraph dev` uses the patched runtime:
@@ -46,7 +49,7 @@ Verify that `langgraph dev` uses the patched runtime:
 python -c "import langgraph_runtime_inmem as m; print(m.__version__)"
 ```
 
-Expected output: `0.33.3.post2`.
+Expected output: `0.33.3.post3`.
 
 The primary tested dependency set is:
 
@@ -55,7 +58,7 @@ langgraph==1.2.11
 langgraph-api==0.13.3
 langgraph-cli[inmem]==0.4.31
 langgraph-checkpoint==4.2.0
-langgraph-runtime-inmem==0.33.3.post2
+langgraph-runtime-inmem==0.33.3.post3
 ```
 
 All tests also pass with `langgraph-api==0.13.2`, so the patch can be installed
@@ -99,6 +102,48 @@ With production-like TTL values, newly active data is intentionally not removed
 during a short smoke test.  Use a per-thread or per-item TTL of `0` in a test
 request, or run the included unit tests, to exercise expiration immediately.
 
+## Sweep size instrumentation
+
+Every completed Store and checkpoint sweep logs both human-readable sizes and
+raw byte estimates. Example fields:
+
+```text
+Store TTL sweep completed
+deleted_items=1824
+deleted_size=143.7 MB
+deleted_size_bytes=150680371
+total_before=512.4 MB
+total_before_bytes=537290342
+deleted_ratio=28.0%
+deleted_ratio_percent=28.0
+```
+
+The checkpoint log uses the same fields and also includes
+`threads_processed` and `threads_deleted`:
+
+```text
+Checkpoint TTL sweep completed
+deleted_items=1824
+threads_processed=120
+threads_deleted=25
+deleted_size=143.7 MB
+total_before=512.4 MB
+deleted_ratio=28.0%
+```
+
+These values estimate serialized payload size; they are not a direct RSS or
+Python heap measurement. Store items and vectors are measured with
+`pickle.dumps(...)` only when they are written. Checkpoints, pending writes,
+and channel blobs reuse lengths from the runtime's already-serialized payloads.
+Overwrites and deletes update a small in-memory tracker, and persisted data is
+scanned once when the runtime starts. At the sweep boundary, totals and deleted
+metrics use tracked per-item/per-thread integer lookups. `keep_latest` already
+walks the checkpoint entries it removes; its accounting only adds constant-time
+`len(...)` calls on their serialized buffers and never serializes them again.
+Deleting the underlying expired records still costs time proportional to the
+records actually removed. Python's allocator may retain freed arenas, so
+process RSS does not necessarily fall by the logged amount immediately.
+
 ## Test
 
 From this directory, with the LangGraph dev dependencies installed:
@@ -112,4 +157,5 @@ release, `keep_latest`, DeltaChannel safety, repeat-sweep prevention, sweep
 limits, active-run protection, and the thread background loop.  Store tests
 cover default and per-item TTLs, read/search refresh, write reset, non-expiring
 items, item/vector cleanup, non-retroactive defaults, background sweeping,
-disk-backed restart persistence, and the Agent Server store wrapper.
+disk-backed restart persistence, size accounting/logging, and the Agent Server
+store wrapper.

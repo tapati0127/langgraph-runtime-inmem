@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import typing
 import uuid
 from collections import defaultdict
@@ -47,6 +48,127 @@ _TRANSIENT_CONFIGURABLE_KEYS = frozenset(
 DISABLE_FILE_PERSISTENCE = (
     os.getenv("LANGGRAPH_DISABLE_FILE_PERSISTENCE", "false").lower() == "true"
 )
+
+
+def _component_size(value: Any) -> int:
+    """Measure already-serialized components without serializing them again."""
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value.encode())
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return len(value)
+    return len(str(value).encode())
+
+
+def _typed_payload_size(value: tuple[str, bytes]) -> int:
+    return _component_size(value[0]) + _component_size(value[1])
+
+
+def _checkpoint_entry_size(
+    checkpoint_id: Any,
+    entry: tuple[tuple[str, bytes], tuple[str, bytes], str | None],
+) -> int:
+    checkpoint, metadata, parent_id = entry
+    return (
+        _component_size(checkpoint_id)
+        + _typed_payload_size(checkpoint)
+        + _typed_payload_size(metadata)
+        + _component_size(parent_id)
+    )
+
+
+def _write_group_size(
+    checkpoint_id: Any,
+    writes: dict[tuple[str, int], tuple[str, str, tuple[str, bytes], str]],
+) -> int:
+    size = _component_size(checkpoint_id)
+    for inner_key, (task_id, channel, value, task_path) in writes.items():
+        size += sum(_component_size(part) for part in inner_key)
+        size += _component_size(task_id)
+        size += _component_size(channel)
+        size += _typed_payload_size(value)
+        size += _component_size(task_path)
+    return size
+
+
+def _blob_entry_size(
+    channel: str,
+    version: Any,
+    value: tuple[str, bytes],
+) -> int:
+    return (
+        _component_size(channel) + _component_size(version) + _typed_payload_size(value)
+    )
+
+
+class _CheckpointSizeState:
+    """Small shared aggregate tracker: two integers per checkpoint thread."""
+
+    def __init__(self) -> None:
+        self._by_thread: dict[str, tuple[int, int]] = {}
+        self._total_bytes = 0
+        self._total_checkpoints = 0
+        self._lock = threading.RLock()
+
+    @property
+    def total_bytes(self) -> int:
+        with self._lock:
+            return self._total_bytes
+
+    @property
+    def total_checkpoints(self) -> int:
+        with self._lock:
+            return self._total_checkpoints
+
+    def thread_bytes(self, thread_id: str) -> int:
+        with self._lock:
+            return self._by_thread.get(thread_id, (0, 0))[0]
+
+    def thread_checkpoints(self, thread_id: str) -> int:
+        with self._lock:
+            return self._by_thread.get(thread_id, (0, 0))[1]
+
+    def adjust(
+        self,
+        thread_id: str,
+        size_delta: int,
+        checkpoint_delta: int = 0,
+    ) -> None:
+        with self._lock:
+            old_size, old_count = self._by_thread.get(thread_id, (0, 0))
+            new_size = max(0, old_size + size_delta)
+            new_count = max(0, old_count + checkpoint_delta)
+            self._total_bytes += new_size - old_size
+            self._total_checkpoints += new_count - old_count
+            if new_size or new_count:
+                self._by_thread[thread_id] = (new_size, new_count)
+            else:
+                self._by_thread.pop(thread_id, None)
+
+    def remove_thread(self, thread_id: str) -> int:
+        with self._lock:
+            size_bytes, checkpoint_count = self._by_thread.pop(thread_id, (0, 0))
+            self._total_bytes -= size_bytes
+            self._total_checkpoints -= checkpoint_count
+            return size_bytes
+
+    def copy_thread(self, source_thread_id: str, target_thread_id: str) -> None:
+        with self._lock:
+            old_size, old_count = self._by_thread.get(target_thread_id, (0, 0))
+            new_size, new_count = self._by_thread.get(source_thread_id, (0, 0))
+            self._total_bytes += new_size - old_size
+            self._total_checkpoints += new_count - old_count
+            if new_size or new_count:
+                self._by_thread[target_thread_id] = (new_size, new_count)
+            else:
+                self._by_thread.pop(target_thread_id, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._by_thread.clear()
+            self._total_bytes = 0
+            self._total_checkpoints = 0
 
 
 class InMemorySaver(InMemorySaverBase):
@@ -102,6 +224,64 @@ class InMemorySaver(InMemorySaverBase):
             serde=serde if serde is not None else Serializer(),
             factory=factory if not DISABLE_FILE_PERSISTENCE else defaultdict,
         )
+        self._size_state = _CheckpointSizeState()
+        self._rebuild_size_tracking()
+
+    @property
+    def estimated_size_bytes(self) -> int:
+        """Estimated serialized bytes held by all checkpoint data."""
+        return self._size_state.total_bytes
+
+    @property
+    def estimated_checkpoint_count(self) -> int:
+        """Number of checkpoint records included in size tracking."""
+        return self._size_state.total_checkpoints
+
+    def estimated_size_for_thread(self, thread_id: str | uuid.UUID) -> int:
+        return self._size_state.thread_bytes(str(thread_id))
+
+    def estimated_checkpoint_count_for_thread(self, thread_id: str | uuid.UUID) -> int:
+        return self._size_state.thread_checkpoints(str(thread_id))
+
+    def _rebuild_size_tracking(self) -> None:
+        """Rebuild estimates once after loading the persistent dictionaries."""
+        self._size_state.clear()
+        for thread_id, namespaces in self.storage.items():
+            for _checkpoint_ns, checkpoints in namespaces.items():
+                for checkpoint_id, entry in checkpoints.items():
+                    self._size_state.adjust(
+                        str(thread_id),
+                        _checkpoint_entry_size(checkpoint_id, entry),
+                        1,
+                    )
+        for (thread_id, _checkpoint_ns, checkpoint_id), writes in self.writes.items():
+            self._size_state.adjust(
+                str(thread_id), _write_group_size(checkpoint_id, writes)
+            )
+        for (thread_id, _checkpoint_ns, channel, version), value in self.blobs.items():
+            self._size_state.adjust(
+                str(thread_id), _blob_entry_size(channel, version, value)
+            )
+
+    def copy_thread_size(
+        self,
+        source_thread_id: str | uuid.UUID,
+        target_thread_id: str | uuid.UUID,
+    ) -> None:
+        """Copy aggregate accounting after the runtime copies a thread."""
+        self._size_state.copy_thread(str(source_thread_id), str(target_thread_id))
+
+    def discard_checkpoint_size(
+        self,
+        thread_id: str | uuid.UUID,
+        _checkpoint_ns: str,
+        checkpoint_id: Any,
+        entry: Any,
+    ) -> int:
+        """Discard the estimate for one checkpoint removed by internal code."""
+        size_bytes = _checkpoint_entry_size(checkpoint_id, entry)
+        self._size_state.adjust(str(thread_id), -size_bytes, -1)
+        return size_bytes
 
     def put(
         self,
@@ -136,7 +316,66 @@ class InMemorySaver(InMemorySaverBase):
             # Avoid type inconsistencies
             checkpoint = checkpoint.copy()
             checkpoint["id"] = str(checkpoint["id"])
-        return super().put(config, checkpoint, metadata, new_versions)
+        thread_id = config["configurable"]["thread_id"]
+        checkpoint_ns = config["configurable"]["checkpoint_ns"]
+        checkpoint_id = checkpoint["id"]
+        old_entry = (
+            self.storage.get(thread_id, {}).get(checkpoint_ns, {}).get(checkpoint_id)
+        )
+        old_size = (
+            _checkpoint_entry_size(checkpoint_id, old_entry)
+            if old_entry is not None
+            else 0
+        )
+        old_size += sum(
+            _blob_entry_size(channel, version, self.blobs[blob_key])
+            for channel, version in new_versions.items()
+            if (blob_key := (thread_id, checkpoint_ns, channel, version)) in self.blobs
+        )
+
+        result = super().put(config, checkpoint, metadata, new_versions)
+        new_size = _checkpoint_entry_size(
+            checkpoint_id,
+            self.storage[thread_id][checkpoint_ns][checkpoint_id],
+        )
+        new_size += sum(
+            _blob_entry_size(
+                channel,
+                version,
+                self.blobs[(thread_id, checkpoint_ns, channel, version)],
+            )
+            for channel, version in new_versions.items()
+        )
+        self._size_state.adjust(
+            str(thread_id), new_size - old_size, int(old_entry is None)
+        )
+        return result
+
+    def put_writes(
+        self,
+        config: RunnableConfig,
+        writes: Sequence[tuple[str, Any]],
+        task_id: str,
+        task_path: str = "",
+    ) -> None:
+        thread_id = config["configurable"]["thread_id"]
+        checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
+        checkpoint_id = config["configurable"]["checkpoint_id"]
+        outer_key = (thread_id, checkpoint_ns, checkpoint_id)
+        old_writes = self.writes.get(outer_key)
+        old_size = (
+            _write_group_size(checkpoint_id, old_writes)
+            if old_writes is not None
+            else 0
+        )
+        super().put_writes(config, writes, task_id, task_path)
+        new_writes = self.writes.get(outer_key)
+        new_size = (
+            _write_group_size(checkpoint_id, new_writes)
+            if new_writes is not None
+            else 0
+        )
+        self._size_state.adjust(str(thread_id), new_size - old_size)
 
     def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         if isinstance(config["configurable"].get("checkpoint_id"), uuid.UUID):
@@ -153,10 +392,15 @@ class InMemorySaver(InMemorySaverBase):
         self.storage.clear()
         self.writes.clear()
         self.blobs.clear()
+        self._size_state.clear()
         for suffix in ["1", "2", "3"]:
             file_path = f"{self.filename}{suffix}.pckl"
             if os.path.exists(file_path):
                 os.remove(file_path)
+
+    def delete_thread(self, thread_id: str) -> None:
+        super().delete_thread(thread_id)
+        self._size_state.remove_thread(str(thread_id))
 
     def prune(
         self,
@@ -191,6 +435,8 @@ class InMemorySaver(InMemorySaverBase):
 
             kept_write_keys: set[tuple[str, str, str]] = set()
             kept_blob_keys: set[tuple[Any, ...]] = set()
+            removed_size = 0
+            removed_checkpoints = 0
 
             for checkpoint_ns, checkpoints in list(namespaces.items()):
                 if not checkpoints:
@@ -241,6 +487,12 @@ class InMemorySaver(InMemorySaverBase):
                             needed_channels.remove(channel)
                     parent_id = parent_entry[2]
 
+                for checkpoint_id in checkpoints.keys() - keep_ids:
+                    removed_size += _checkpoint_entry_size(
+                        checkpoint_id,
+                        checkpoints[checkpoint_id],
+                    )
+                    removed_checkpoints += 1
                 namespaces[checkpoint_ns] = {
                     checkpoint_id: entry
                     for checkpoint_id, entry in checkpoints.items()
@@ -258,11 +510,23 @@ class InMemorySaver(InMemorySaverBase):
             for key in list(self.writes):
                 normalized_key = (str(key[0]), key[1], str(key[2]))
                 if str(key[0]) == thread_id and normalized_key not in kept_write_keys:
+                    removed_size += _write_group_size(key[2], self.writes[key])
                     del self.writes[key]
 
             for key in list(self.blobs):
                 if str(key[0]) == thread_id and key not in kept_blob_keys:
+                    removed_size += _blob_entry_size(
+                        key[2],
+                        key[3],
+                        self.blobs[key],
+                    )
                     del self.blobs[key]
+
+            self._size_state.adjust(
+                thread_id,
+                -removed_size,
+                -removed_checkpoints,
+            )
 
     async def aprune(
         self,
@@ -403,6 +667,7 @@ def Checkpointer(*args, unpack_hook=None, **kwargs):
         saver.writes = MEMORY.writes
         saver.blobs = MEMORY.blobs
         saver.storage = MEMORY.storage
+        saver._size_state = MEMORY._size_state
         return saver
     return MEMORY
 

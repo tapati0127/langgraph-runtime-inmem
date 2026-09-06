@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from langgraph.store.base import TTLConfig
 
-from langgraph_runtime_inmem import _persistence
+from langgraph_runtime_inmem import _persistence, size_tracking
 from langgraph_runtime_inmem import store as store_module
 
 
@@ -212,6 +212,75 @@ async def test_sweep_removes_item_vectors_and_ttl_metadata(
 
 
 @pytest.mark.asyncio
+async def test_size_tracking_updates_on_write_delete_and_ttl_sweep(
+    store_factory,
+    clock: MutableClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = store_factory({"default_ttl": 1})
+    namespace = ("size-tracking",)
+    log_events = []
+
+    class FakeLogger:
+        def info(self, event, **fields):
+            log_events.append((event, fields))
+
+        def exception(self, *args, **kwargs):
+            raise AssertionError("The Store sweep should not log an exception")
+
+    monkeypatch.setattr(store_module, "logger", FakeLogger())
+
+    await store.aput(namespace, "permanent", {"payload": "x"}, ttl=None)
+    first_size = store.estimated_size_bytes
+    await store.aput(namespace, "permanent", {"payload": "x" * 4096}, ttl=None)
+    assert store.estimated_size_bytes > first_size
+
+    await store.aput(namespace, "expired", {"payload": "y" * 2048})
+    total_before = store.estimated_size_bytes
+    clock.advance(minutes=2)
+
+    def fail_if_reserialized(*args, **kwargs):
+        raise AssertionError("TTL sweep must use tracked integers, not pickle.dumps")
+
+    monkeypatch.setattr(size_tracking.pickle, "dumps", fail_if_reserialized)
+
+    assert await store.sweep_ttl() == 1
+    stats = store.last_ttl_sweep_stats
+    assert stats["deleted_items"] == 1
+    assert stats["deleted_size_bytes"] > 0
+    assert stats["total_before_bytes"] == total_before
+    assert store.estimated_size_bytes == total_before - stats["deleted_size_bytes"]
+    assert 0 < stats["deleted_ratio_percent"] < 100
+
+    _, fields = next(
+        event for event in log_events if event[0] == "Store TTL sweep completed"
+    )
+    assert fields["deleted_items"] == 1
+    assert fields["deleted_size_bytes"] == stats["deleted_size_bytes"]
+    assert fields["total_before_bytes"] == total_before
+    assert fields["deleted_ratio"].endswith("%")
+
+    await store.adelete(namespace, "permanent")
+    assert store.estimated_size_bytes == 0
+
+    log_events.clear()
+    assert await store.sweep_ttl() == 0
+    assert len(log_events) == 1
+    event, fields = log_events[0]
+    assert event == "Store TTL sweep completed"
+    assert fields.pop("duration") >= 0
+    assert fields == {
+        "deleted_items": 0,
+        "deleted_size": "0 B",
+        "deleted_size_bytes": 0,
+        "total_before": "0 B",
+        "total_before_bytes": 0,
+        "deleted_ratio": "0.0%",
+        "deleted_ratio_percent": 0.0,
+    }
+
+
+@pytest.mark.asyncio
 async def test_background_sweeper_runs_once_and_can_be_stopped(
     store_factory,
 ) -> None:
@@ -257,12 +326,15 @@ async def test_ttl_metadata_survives_disk_backed_restart(
 
     second = store_module.DiskBackedInMemStore(ttl={"default_ttl": 10})
     assert await second.aget(("persisted",), "item", refresh_ttl=False) is not None
+    total_before = second.estimated_size_bytes
+    assert total_before > 0
     assert second._ttl[(("persisted",), "item")]["expires_at"] == (
         clock.now + timedelta(minutes=10)
     )
 
     clock.advance(minutes=11)
     assert await second.sweep_ttl() == 1
+    assert second.last_ttl_sweep_stats["deleted_size_bytes"] == total_before
     assert await second.aget(("persisted",), "item", refresh_ttl=False) is None
     second.close()
 
@@ -292,8 +364,10 @@ async def test_server_store_wrapper_propagates_ttl_config(
     assert wrapped.supports_ttl is True
     assert wrapped.ttl_config == store_module.STORE.ttl_config
     await wrapped.aput(("wrapped",), "item", {"value": 1})
+    assert wrapped.estimated_size_bytes > 0
     clock.advance(minutes=2)
     assert await wrapped.sweep_ttl() == 1
+    assert wrapped.last_ttl_sweep_stats["deleted_items"] == 1
     assert await wrapped.aget(("wrapped",), "item", refresh_ttl=False) is None
 
     wrapped._task.cancel()
