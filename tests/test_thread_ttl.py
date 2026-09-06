@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
-from langgraph.checkpoint.memory import InMemorySaver as OSSInMemorySaver
 from langgraph.checkpoint.serde.types import _DeltaSnapshot
+
+from langgraph_runtime_inmem import checkpoint as checkpoint_module
 from langgraph_runtime_inmem import ops
 from langgraph_runtime_inmem.checkpoint import InMemorySaver
 
@@ -36,8 +36,8 @@ def conn() -> FakeConnection:
 @pytest.fixture
 def saver(monkeypatch: pytest.MonkeyPatch) -> InMemorySaver:
     # Avoid disk persistence in unit tests while exercising the patched saver.
-    instance = object.__new__(InMemorySaver)
-    OSSInMemorySaver.__init__(instance, factory=defaultdict)
+    monkeypatch.setattr(checkpoint_module, "DISABLE_FILE_PERSISTENCE", True)
+    instance = InMemorySaver()
     monkeypatch.setattr(ops, "Checkpointer", lambda *args, **kwargs: instance)
     return instance
 
@@ -59,6 +59,7 @@ def add_checkpoint(
     namespace: str = "",
     value: object = None,
     materialized: bool = True,
+    run_id: UUID | None = None,
 ) -> None:
     config = {
         "configurable": {
@@ -80,7 +81,11 @@ def add_checkpoint(
             "pending_sends": [],
             "updated_channels": ["state"],
         },
-        {"source": "loop", "step": int(checkpoint_id[:4])},
+        {
+            "source": "loop",
+            "step": int(checkpoint_id[:4]),
+            **({"run_id": str(run_id)} if run_id else {}),
+        },
         {"state": checkpoint_id},
     )
     saver.put_writes(
@@ -118,6 +123,84 @@ async def create_thread(
         thread["updated_at"] = old
         thread["state_updated_at"] = old
     return thread
+
+
+def test_checkpoint_size_tracking_handles_overwrite_and_delete(saver) -> None:
+    thread_id = uuid4()
+    saver.put_writes(
+        {
+            "configurable": {
+                "thread_id": str(thread_id),
+                "checkpoint_ns": "",
+                "checkpoint_id": "empty",
+            }
+        },
+        [],
+        "task-empty",
+    )
+    assert not saver.writes
+    assert saver.estimated_size_bytes == 0
+
+    add_checkpoint(saver, thread_id, "0001", value="small")
+    first_size = saver.estimated_size_bytes
+
+    add_checkpoint(saver, thread_id, "0001", value="x" * 4096)
+    assert saver.estimated_checkpoint_count == 1
+    assert saver.estimated_size_bytes > first_size
+
+    saver.delete_thread(str(thread_id))
+    assert saver.estimated_checkpoint_count == 0
+    assert saver.estimated_size_bytes == 0
+
+
+def test_checkpoint_size_tracking_can_be_rebuilt(saver) -> None:
+    thread_id = uuid4()
+    add_checkpoint(saver, thread_id, "0001", value={"payload": "x" * 1024})
+    expected_size = saver.estimated_size_bytes
+
+    saver._size_state.clear()
+    assert saver.estimated_size_bytes == 0
+    saver._rebuild_size_tracking()
+
+    assert saver.estimated_size_bytes == expected_size
+    assert saver.estimated_checkpoint_count == 1
+
+
+@pytest.mark.asyncio
+async def test_thread_copy_tracks_copied_checkpoint_size(conn, saver) -> None:
+    thread = await create_thread(conn)
+    source_id = thread["thread_id"]
+    add_checkpoint(saver, source_id, "0001", value={"payload": "x" * 1024})
+    source_size = saver.estimated_size_for_thread(source_id)
+
+    copied_iterator = await ops.Threads.copy(conn, source_id)
+    copied_thread = await anext(copied_iterator)
+    copied_id = copied_thread["thread_id"]
+
+    assert saver.estimated_size_for_thread(copied_id) == source_size
+    assert saver.estimated_checkpoint_count_for_thread(copied_id) == 1
+    assert saver.estimated_size_bytes == source_size * 2
+
+
+@pytest.mark.asyncio
+async def test_run_checkpoint_delete_updates_size_tracking(conn, saver) -> None:
+    thread_id = uuid4()
+    deleted_run_id = uuid4()
+    add_checkpoint(
+        saver,
+        thread_id,
+        "0001",
+        value="deleted run",
+        run_id=deleted_run_id,
+    )
+    add_checkpoint(saver, thread_id, "0002", value="retained run")
+    total_before = saver.estimated_size_bytes
+
+    await ops._delete_checkpoints_for_thread(thread_id, conn, deleted_run_id)
+
+    assert set(saver.storage[str(thread_id)][""]) == {"0002"}
+    assert saver.estimated_checkpoint_count == 1
+    assert 0 < saver.estimated_size_bytes < total_before
 
 
 @pytest.mark.asyncio
@@ -164,8 +247,12 @@ async def test_delete_sweep_cascades_and_releases_all_checkpoint_memory(
     conn.store["crons"].append({"cron_id": uuid4(), "thread_id": thread_id})
     add_checkpoint(saver, thread_id, "0001", value={"large": "payload"})
 
+    total_before = saver.estimated_size_bytes
+    stats = {}
     assert saver.storage and saver.writes and saver.blobs
-    assert await ops.Threads.sweep_ttl(conn) == (1, 1)
+    assert total_before > 0
+    assert saver.estimated_checkpoint_count == 1
+    assert await ops.Threads.sweep_ttl(conn, stats=stats) == (1, 1)
     assert conn.store["threads"] == []
     assert conn.store["runs"] == []
     assert conn.store["crons"] == []
@@ -173,6 +260,13 @@ async def test_delete_sweep_cascades_and_releases_all_checkpoint_memory(
     assert not saver.storage
     assert not saver.writes
     assert not saver.blobs
+    assert saver.estimated_size_bytes == 0
+    assert stats == {
+        "deleted_items": 1,
+        "deleted_size_bytes": total_before,
+        "total_before_bytes": total_before,
+        "size_tracking_available": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -201,12 +295,20 @@ async def test_global_keep_latest_prunes_once_then_rearms_after_activity(
         value="child-latest",
     )
 
-    assert await ops.Threads.sweep_ttl(conn) == (1, 0)
+    total_before = saver.estimated_size_bytes
+    stats = {}
+    assert saver.estimated_checkpoint_count == 4
+    assert await ops.Threads.sweep_ttl(conn, stats=stats) == (1, 0)
     assert len(conn.store["threads"]) == 1
     assert set(saver.storage[str(thread_id)][""]) == {"0002"}
     assert set(saver.storage[str(thread_id)]["child"]) == {"0002"}
     assert len([key for key in saver.writes if key[0] == str(thread_id)]) == 2
     assert len([key for key in saver.blobs if key[0] == str(thread_id)]) == 2
+    assert saver.estimated_checkpoint_count == 2
+    assert 0 < saver.estimated_size_bytes < total_before
+    assert stats["deleted_items"] == 2
+    assert stats["deleted_size_bytes"] == total_before - saver.estimated_size_bytes
+    assert stats["total_before_bytes"] == total_before
 
     # The same inactive state is not repeatedly pruned every sweep.
     assert await ops.Threads.sweep_ttl(conn) == (0, 0)

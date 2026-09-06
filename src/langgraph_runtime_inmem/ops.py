@@ -1640,6 +1640,7 @@ class Threads(Authenticated):
                     if str(k[0]) == str(thread_id):
                         new_key = (str(new_thread_id), *k[1:])
                         checkpointer.blobs[new_key] = checkpointer.blobs[k]
+                checkpointer.copy_thread_size(thread_id, new_thread_id)
 
             async def row_generator() -> AsyncIterator[Thread]:
                 yield new_thread
@@ -1652,13 +1653,34 @@ class Threads(Authenticated):
         *,
         limit: int | None = None,
         batch_size: int = 100,
+        stats: dict[str, Any] | None = None,
     ) -> tuple[int, int]:
         """Sweep expired threads using their per-thread or global TTL policy.
 
         Returns ``(threads_processed, threads_deleted)``.  A
         ``keep_latest`` thread counts as processed but not deleted.
         """
+        checkpointer = await _get_checkpointer(conn) if stats is not None else None
+        total_before = getattr(checkpointer, "estimated_size_bytes", None)
+        size_for_thread = getattr(checkpointer, "estimated_size_for_thread", None)
+        count_for_thread = getattr(
+            checkpointer, "estimated_checkpoint_count_for_thread", None
+        )
+        size_tracking_available = isinstance(total_before, int) and callable(
+            size_for_thread
+        )
+        count_tracking_available = callable(count_for_thread)
+
         if limit is not None and limit <= 0:
+            if stats is not None:
+                stats.update(
+                    {
+                        "deleted_items": 0 if count_tracking_available else None,
+                        "deleted_size_bytes": 0 if size_tracking_available else None,
+                        "total_before_bytes": total_before,
+                        "size_tracking_available": size_tracking_available,
+                    }
+                )
             return (0, 0)
         batch_size = max(1, batch_size)
 
@@ -1704,9 +1726,20 @@ class Threads(Authenticated):
         if effective_limit is not None:
             expired = expired[:effective_limit]
 
+        tracked_thread_ids = [str(thread_id) for _, thread_id, _, _, _ in expired]
+        sizes_before = (
+            {thread_id: size_for_thread(thread_id) for thread_id in tracked_thread_ids}
+            if size_tracking_available
+            else {}
+        )
+        counts_before = (
+            {thread_id: count_for_thread(thread_id) for thread_id in tracked_thread_ids}
+            if count_tracking_available
+            else {}
+        )
+
         processed = 0
         deleted = 0
-        checkpointer = None
         for offset in range(0, len(expired), batch_size):
             batch = expired[offset : offset + batch_size]
             keep_latest_ids = [
@@ -1736,6 +1769,32 @@ class Threads(Authenticated):
                     ttl_state["last_swept_updated_at"] = updated_at
                     _thread_ttl_store(conn)[str(thread_id)] = ttl_state
                     processed += 1
+
+        if stats is not None:
+            deleted_size = (
+                sum(
+                    max(size_bytes - size_for_thread(thread_id), 0)
+                    for thread_id, size_bytes in sizes_before.items()
+                )
+                if size_tracking_available
+                else None
+            )
+            deleted_items = (
+                sum(
+                    max(checkpoint_count - count_for_thread(thread_id), 0)
+                    for thread_id, checkpoint_count in counts_before.items()
+                )
+                if count_tracking_available
+                else None
+            )
+            stats.update(
+                {
+                    "deleted_items": deleted_items,
+                    "deleted_size_bytes": deleted_size,
+                    "total_before_bytes": total_before,
+                    "size_tracking_available": size_tracking_available,
+                }
+            )
 
         return (processed, deleted)
 
@@ -4067,9 +4126,16 @@ async def _delete_checkpoints_for_thread(
         # Look through metadata
         run_id = str(run_id)
         for checkpoint_ns, checkpoints in list(checkpointer.storage[thread_id].items()):
-            for checkpoint_id, (_, metadata_b, _) in list(checkpoints.items()):
+            for checkpoint_id, entry in list(checkpoints.items()):
+                _, metadata_b, _ = entry
                 metadata = checkpointer.serde.loads_typed(metadata_b)
                 if metadata.get("run_id") == run_id:
+                    checkpointer.discard_checkpoint_size(
+                        thread_id,
+                        checkpoint_ns,
+                        checkpoint_id,
+                        entry,
+                    )
                     del checkpointer.storage[thread_id][checkpoint_ns][checkpoint_id]
                     if not checkpointer.storage[thread_id][checkpoint_ns]:
                         del checkpointer.storage[thread_id][checkpoint_ns]

@@ -1,12 +1,13 @@
 import asyncio
-import logging
 import os
 import threading
+import time
 from collections import defaultdict
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypedDict
 
+import structlog
 from langgraph.checkpoint.memory import PersistentDict
 from langgraph.store.base import (
     GetOp,
@@ -21,9 +22,14 @@ from langgraph.store.base.batch import AsyncBatchedBaseStore
 from langgraph.store.memory import InMemoryStore
 
 from langgraph_runtime_inmem import _persistence
+from langgraph_runtime_inmem.size_tracking import (
+    SizeTracker,
+    estimate_pickle_size,
+    size_log_fields,
+)
 
 _STORE_CONFIG = None
-logger = logging.getLogger(__name__)
+logger = structlog.stdlib.get_logger(__name__)
 
 
 class StoreTTLRecord(TypedDict):
@@ -31,6 +37,15 @@ class StoreTTLRecord(TypedDict):
 
     expires_at: datetime
     ttl_minutes: float
+
+
+class StoreTTLSweepStats(TypedDict):
+    """Size and item counts captured by the most recent Store TTL sweep."""
+
+    deleted_items: int
+    deleted_size_bytes: int
+    total_before_bytes: int
+    deleted_ratio_percent: float
 
 
 def _utcnow() -> datetime:
@@ -72,6 +87,14 @@ class DiskBackedInMemStore(InMemoryStore):
             self._vectors = defaultdict(lambda: defaultdict(dict))
             self._ttl = {}
         self._drop_orphaned_ttl_records()
+        self._size_tracker = SizeTracker()
+        self._rebuild_size_tracking()
+        self._last_ttl_sweep_stats: StoreTTLSweepStats = {
+            "deleted_items": 0,
+            "deleted_size_bytes": 0,
+            "total_before_bytes": self.estimated_size_bytes,
+            "deleted_ratio_percent": 0.0,
+        }
 
     def _load_data(self, container: PersistentDict, which: str) -> None:
         if not container.filename:
@@ -98,6 +121,38 @@ class DiskBackedInMemStore(InMemoryStore):
         for namespace, key in list(self._ttl):
             if key not in self._data.get(namespace, {}):
                 self._ttl.pop((namespace, key), None)
+
+    @property
+    def estimated_size_bytes(self) -> int:
+        """Estimated serialized bytes currently held by Store items and vectors."""
+        return self._size_tracker.total_bytes
+
+    @property
+    def last_ttl_sweep_stats(self) -> StoreTTLSweepStats:
+        """Return a copy of the most recent Store TTL sweep measurements."""
+        return self._last_ttl_sweep_stats.copy()
+
+    def _estimate_item_size(self, namespace: tuple[str, ...], key: str) -> int:
+        item = self._data.get(namespace, {}).get(key)
+        vectors = self._vectors.get(namespace, {}).get(key)
+        return estimate_pickle_size((namespace, key, item, vectors))
+
+    def _track_item_size(self, namespace: tuple[str, ...], key: str) -> None:
+        item_key = (namespace, key)
+        if key not in self._data.get(namespace, {}):
+            self._size_tracker.remove(item_key)
+            return
+        self._size_tracker.set_size(
+            item_key,
+            self._estimate_item_size(namespace, key),
+        )
+
+    def _rebuild_size_tracking(self) -> None:
+        """Rebuild estimates once after loading persisted Store data."""
+        self._size_tracker.clear()
+        for namespace, items in self._data.items():
+            for key in items:
+                self._track_item_size(namespace, key)
 
     def _refresh_ttl(
         self,
@@ -169,6 +224,9 @@ class DiskBackedInMemStore(InMemoryStore):
             else:
                 self._ttl[item_key] = record
 
+        for namespace, key in put_ops:
+            self._track_item_size(namespace, key)
+
         # InMemoryStore uses defaultdict and leaves empty buckets after deletes.
         for namespace, _ in put_ops:
             if not self._data.get(namespace):
@@ -183,8 +241,10 @@ class DiskBackedInMemStore(InMemoryStore):
 
     async def sweep_ttl(self) -> int:
         """Delete expired items and their vectors, returning the item count."""
+        sweep_started = time.perf_counter()
         async with self._operation_lock:
             now = _utcnow()
+            total_before = self.estimated_size_bytes
             expired = [
                 item_key
                 for item_key, record in self._ttl.items()
@@ -192,6 +252,7 @@ class DiskBackedInMemStore(InMemoryStore):
             ]
 
             deleted = 0
+            deleted_size = 0
             touched_namespaces: set[tuple[str, ...]] = set()
             for namespace, key in expired:
                 touched_namespaces.add(namespace)
@@ -199,6 +260,9 @@ class DiskBackedInMemStore(InMemoryStore):
                 if data is not None and key in data:
                     data.pop(key, None)
                     deleted += 1
+                    deleted_size += self._size_tracker.remove((namespace, key))
+                else:
+                    self._size_tracker.remove((namespace, key))
                 vectors = self._vectors.get(namespace)
                 if vectors is not None:
                     vectors.pop(key, None)
@@ -209,7 +273,24 @@ class DiskBackedInMemStore(InMemoryStore):
                     self._data.pop(namespace, None)
                 if not self._vectors.get(namespace):
                     self._vectors.pop(namespace, None)
-            return deleted
+
+            deleted_ratio = (
+                round(100 * deleted_size / total_before, 1) if total_before > 0 else 0.0
+            )
+            self._last_ttl_sweep_stats = {
+                "deleted_items": deleted,
+                "deleted_size_bytes": deleted_size,
+                "total_before_bytes": total_before,
+                "deleted_ratio_percent": deleted_ratio,
+            }
+
+        logger.info(
+            "Store TTL sweep completed",
+            deleted_items=deleted,
+            **size_log_fields(deleted_size, total_before),
+            duration=time.perf_counter() - sweep_started,
+        )
+        return deleted
 
     async def start_ttl_sweeper(
         self,
@@ -231,7 +312,10 @@ class DiskBackedInMemStore(InMemoryStore):
         interval = float(configured_interval if configured_interval is not None else 5)
         if interval <= 0:
             raise ValueError("Store TTL sweep interval must be greater than zero.")
-        logger.info("Starting store TTL sweeper with interval %s minutes", interval)
+        logger.info(
+            f"Starting store TTL sweeper with interval {interval:g} minutes",
+            interval_minutes=interval,
+        )
 
         async def _sweep_loop() -> None:
             while not self._ttl_stop_event.is_set():
@@ -245,9 +329,7 @@ class DiskBackedInMemStore(InMemoryStore):
                     except TimeoutError:
                         pass
 
-                    expired_items = await self.sweep_ttl()
-                    if expired_items > 0:
-                        logger.info("Store swept %s expired items", expired_items)
+                    await self.sweep_ttl()
                 except asyncio.CancelledError:
                     break
                 except Exception as exc:
@@ -303,6 +385,14 @@ class BatchedStore(AsyncBatchedBaseStore):
         self._store = store
         self.supports_ttl = store.supports_ttl
         self.ttl_config = store.ttl_config
+
+    @property
+    def estimated_size_bytes(self) -> int:
+        return self._store.estimated_size_bytes
+
+    @property
+    def last_ttl_sweep_stats(self) -> StoreTTLSweepStats:
+        return self._store.last_ttl_sweep_stats
 
     def batch(self, ops: Iterable[Op]) -> list[Result]:
         return self._store.batch(ops)
