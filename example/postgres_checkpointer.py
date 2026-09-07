@@ -16,7 +16,7 @@ async def checkpointer() -> AsyncIterator[AsyncPostgresSaver]:
     """Create, initialize, and close the API's PostgreSQL checkpointer."""
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-    database_url = os.environ["DATABASE_URL"]
+    database_url = os.getenv("CHECKPOINT_DATABASE_URL") or os.environ["DATABASE_URL"]
     async with AsyncPostgresSaver.from_conn_string(database_url) as saver:
         await saver.setup()
         yield saver

@@ -13,6 +13,7 @@
     }
   },
   "store": {
+    "path": "./postgres_store.py:store",
     "ttl": {
       "refresh_on_read": true,
       "sweep_interval_minutes": 1,
