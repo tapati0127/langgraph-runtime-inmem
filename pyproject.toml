@@ -20,6 +20,12 @@ dependencies = [
   "structlog>23",
 ]
 
+[project.optional-dependencies]
+postgres = [
+  "langgraph-checkpoint-postgres",
+  "psycopg[binary,pool]>=3.2",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

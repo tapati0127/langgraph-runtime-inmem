@@ -66,6 +66,35 @@ into that environment without requiring an API upgrade.
 
 ## Configuration
 
+### PostgreSQL-backed checkpoints with the in-memory runtime
+
+The example is configured to keep the API runtime and Store in memory while
+persisting graph checkpoints in PostgreSQL. Install the optional dependencies,
+start PostgreSQL, and copy the environment template:
+
+```bash
+pip install -e '.[postgres]'
+docker compose -f example/docker-compose.postgres.yml up -d
+cp example/.env.example example/.env
+langgraph dev --config example/langgraph.json
+```
+
+`example/postgres_checkpointer.py` exposes an async context manager for the
+LangGraph API custom-checkpointer hook. It reads `DATABASE_URL`, initializes
+the PostgreSQL checkpoint schema with `setup()`, and closes its connection when
+the API shuts down. The graph itself remains compiled without a checkpointer so
+the API can inject this configured saver.
+
+Only graph checkpoints and pending checkpoint writes move to PostgreSQL. Thread
+and run metadata, assistants, crons, the queue, and the Store remain owned by
+the in-memory runtime and its local `.langgraph_api` persistence. Run a single
+runtime replica and preserve that directory if those records must survive a
+container replacement.
+
+To return to the built-in in-memory checkpointer, remove `checkpointer.path`
+from `example/langgraph.json` (and remove the PostgreSQL packages from its
+`dependencies` list). The existing `checkpointer.ttl` settings can remain.
+
 The behavior follows LangGraph's official
 [store item TTL configuration](https://docs.langchain.com/langsmith/configure-ttl#configuring-store-item-ttl).
 The requested `langgraph.json` configuration works unchanged and can be
