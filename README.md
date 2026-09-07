@@ -66,6 +66,50 @@ into that environment without requiring an API upgrade.
 
 ## Configuration
 
+### PostgreSQL-backed graph persistence with the in-memory runtime
+
+The example keeps the API runtime in memory while persisting graph checkpoints
+and Store key/value data in PostgreSQL. Install the optional dependencies,
+start PostgreSQL, and copy the environment template:
+
+```bash
+pip install -e '.[postgres]'
+docker compose -f example/docker-compose.postgres.yml up -d
+cp example/.env.example example/.env
+langgraph dev --config example/langgraph.json
+```
+
+`example/postgres_checkpointer.py` and `example/postgres_store.py` expose async
+context managers for the LangGraph API custom persistence hooks. They use
+`DATABASE_URL` by default; `CHECKPOINT_DATABASE_URL` and `STORE_DATABASE_URL`
+can override it when separate databases are desired. Both initialize their
+PostgreSQL schemas with `setup()` and close their connections on API shutdown.
+The graph remains compiled without a checkpointer so the API can inject the
+configured saver.
+
+The custom Store retains TTL. Its default TTL, refresh-on-read behavior, and
+sweep interval come from `STORE_TTL_DEFAULT_MINUTES`,
+`STORE_TTL_REFRESH_ON_READ`, and `STORE_TTL_SWEEP_INTERVAL_MINUTES`; its own
+sweeper starts and stops with the custom Store lifecycle. The matching values
+remain visible in `langgraph.json` as deployment documentation.
+
+Thread and run metadata, assistants, crons, and the queue remain owned by the
+in-memory runtime and its local `.langgraph_api` persistence. Run a single
+runtime replica and preserve that directory if those records must survive a
+container replacement.
+
+To return to built-in in-memory persistence, remove `checkpointer.path` and
+`store.path` from `example/langgraph.json` (and remove the PostgreSQL packages
+from its `dependencies` list). The existing TTL settings can remain.
+
+An opt-in integration test verifies Store persistence across two independent
+connection lifecycles, which models an API process restart:
+
+```bash
+TEST_POSTGRES_DATABASE_URL="$DATABASE_URL" \
+  pytest -q tests/integration/test_postgres_store_restart.py
+```
+
 The behavior follows LangGraph's official
 [store item TTL configuration](https://docs.langchain.com/langsmith/configure-ttl#configuring-store-item-ttl).
 The requested `langgraph.json` configuration works unchanged and can be
