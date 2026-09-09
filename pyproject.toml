@@ -32,7 +32,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 markers = [
-  "integration: requires external infrastructure such as PostgreSQL",
+  "integration: exercises connected components; some tests require external infrastructure such as PostgreSQL",
 ]
 testpaths = ["tests"]
 pythonpath = ["src"]
