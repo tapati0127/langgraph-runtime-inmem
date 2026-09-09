@@ -203,3 +203,21 @@ cover default and per-item TTLs, read/search refresh, write reset, non-expiring
 items, item/vector cleanup, non-retroactive defaults, background sweeping,
 disk-backed restart persistence, size accounting/logging, and the Agent Server
 store wrapper.
+
+The in-memory checkpoint integration tests run a real graph and background
+sweeper to verify `delete`, `keep_latest`, and protection for threads with
+pending or running runs. They run without PostgreSQL:
+
+```bash
+pytest -q tests/integration/test_inmem_checkpoint_sweeper.py
+```
+
+The in-memory Store integration tests inject the batched `Store()` into a real
+graph and run the background TTL sweeper. They cover default and per-item TTLs,
+non-expiring items, vector cleanup, get/search refresh, write reset, and sweeper
+stop/restart. Time-dependent cases control the expiry clock while the sweeper
+uses its real timer. No PostgreSQL or external embedding service is required:
+
+```bash
+pytest -q tests/integration/test_inmem_store_sweeper.py
+```
